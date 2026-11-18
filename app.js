@@ -109,7 +109,7 @@ app.innerHTML = `
         <div class="map-count" id="map-count"><span class="live-pulse"></span><strong>—</strong> buses in view</div>
         <div class="map-controls">
           <button class="square-button" data-action="map-locate" aria-label="Locate me" title="Locate me"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg></button>
-          <button class="square-button" data-action="map-clear-route" aria-label="Show all nearby buses" title="Show all nearby buses" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+          <button id="map-clear-route" class="square-button" data-action="map-clear-route" aria-label="Show all nearby buses" title="Show all nearby buses" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
         </div>
         <aside class="map-dock" aria-label="Buses currently in view">
           <div class="dock-heading"><div><span class="eyebrow">IN THIS AREA</span><h2 id="dock-title">Nearby buses</h2></div><button class="text-button" data-action="navigate" data-view="routes">Browse routes</button></div>

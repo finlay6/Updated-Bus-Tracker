@@ -1,4 +1,4 @@
-const CACHE = 'bus-tracker-static-v4';
+const CACHE = 'bus-tracker-static-v5';
 const FILES = [
   './',
   './index.html',

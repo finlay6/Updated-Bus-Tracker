@@ -2,7 +2,8 @@ import { n as maplibre } from './assets/maplibre-E2rbe4Uv.js';
 
 maplibre.setWorkerUrl(new URL('./assets/maplibre-gl-worker-BslLc_p7.js', import.meta.url).href);
 
-const WORKER_DEFAULT = 'https://holy-sun-5af1.finlaynicholl1.workers.dev';
+const WORKER_DEFAULT = 'https://bustimes.bruhspam6942069.workers.dev';
+const WORKER_OLD_DEFAULT = 'https://holy-sun-5af1.finlaynicholl1.workers.dev';
 const STORAGE = {
   worker: 'bus-tracker:worker',
   oldSettings: 'bus-tracker:v1',
@@ -35,7 +36,7 @@ const legacy = readLegacy();
 function normalizeWorkerBase(value) {
   try {
     const url = new URL(String(value || ''));
-    return url.protocol === 'https:' ? url.href.replace(/\/+$/, '') : WORKER_DEFAULT;
+    return url.protocol === 'https:' ? url.origin : WORKER_DEFAULT;
   } catch {
     return WORKER_DEFAULT;
   }
@@ -43,7 +44,10 @@ function normalizeWorkerBase(value) {
 // Prefer the current Worker configured by this project. An older app may have
 // left a retired proxy URL in `bus-tracker:v1`; keep it available only if the
 // user explicitly saves it in this app's Settings.
-let workerBase = normalizeWorkerBase(localStorage.getItem(STORAGE.worker) || WORKER_DEFAULT);
+const storedWorker = localStorage.getItem(STORAGE.worker);
+let workerBase = normalizeWorkerBase(
+  storedWorker && normalizeWorkerBase(storedWorker) !== WORKER_OLD_DEFAULT ? storedWorker : WORKER_DEFAULT,
+);
 let savedFavorites;
 try {
   savedFavorites = JSON.parse(localStorage.getItem(STORAGE.favorites) || 'null');
@@ -163,6 +167,7 @@ const routeResults = $('#route-results');
 const routeDetail = $('#route-detail');
 
 function setHidden(selector, hidden, root = document) {
+  if (!root) return;
   const element = $(selector, root);
   if (element) element.hidden = Boolean(hidden);
 }
@@ -243,7 +248,7 @@ async function apiGet(kind, path, params = {}, { ttl = 0, signal, text = false, 
           const message = response.status === 404
             ? body.error === 'Endpoint not allowed.'
               ? `The Worker rejected ${url.pathname}. Deploy the current worker/index.js, then check the Worker URL in Settings.`
-              : `The Worker returned 404 for ${url.pathname}. Check that the Worker URL points to the deployed API Worker.`
+              : `The request to ${url.pathname} returned 404. Check that the Worker is deployed and supports this Bustimes endpoint.`
             : body.error || (response.status === 429 ? 'The data provider is busy.' : `Data service returned ${response.status}.`);
           const error = new DataError(
             message,
@@ -362,6 +367,14 @@ function vehicleId(value) {
   return match?.[1] || String(value?.slug || value?.reg || '');
 }
 
+function addVehicleAliases(records, vehicle, fallbackId = '') {
+  if (!vehicle) return;
+  const urlSlug = String(vehicle.url || '').match(/\/vehicles\/([^/?#]+)/)?.[1];
+  for (const key of new Set([vehicleId(vehicle), vehicle.slug, urlSlug, fallbackId].map((value) => String(value || '')).filter(Boolean))) {
+    records.set(key, vehicle);
+  }
+}
+
 function routeOperatorIds(route, detail = null) {
   let raw = route?.operator || detail?.operator || [];
   if (!Array.isArray(raw)) raw = [raw];
@@ -396,34 +409,32 @@ async function loadFleet(route, force = false, signal) {
       await savedPut(key, fleet, 12 * 3600000);
     }
     for (const vehicle of fleet) {
-      const id = vehicleId(vehicle);
-      if (id) records.set(id, vehicle);
+      addVehicleAliases(records, vehicle);
     }
   }
   return records;
 }
 
 async function hydrateVehicles(rows, vehicles, signal) {
-  const missing = [...new Set(rows.map((row) => vehicleId(row.vehicle)).filter((id) => id && !vehicles.has(id)))];
+  const missing = [...new Set(rows.map((row) => vehicleId(row.vehicle)).filter((id) => /^\d+$/.test(id) && !vehicles.has(id)))];
   for (let start = 0; start < missing.length; start += 40) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const ids = missing.slice(start, start + 40);
     try {
       const data = await apiGet('bt', '/api/vehicles/', { id__in: ids.join(','), limit: 1000 }, { signal });
       for (const vehicle of data.results || []) {
-        const id = vehicleId(vehicle);
-        if (id && ids.includes(id)) vehicles.set(id, vehicle);
+        if (ids.includes(vehicleId(vehicle))) addVehicleAliases(vehicles, vehicle);
       }
     } catch {}
   }
-  const unresolved = [...new Set(rows.map((row) => vehicleId(row.vehicle)).filter((id) => id && !vehicles.has(id)))].slice(0, 60);
+  const unresolved = [...new Set(rows.map((row) => vehicleId(row.vehicle)).filter((id) => /^\d+$/.test(id) && !vehicles.has(id)))].slice(0, 60);
   let cursor = 0;
   await Promise.all(Array.from({ length: Math.min(4, unresolved.length) }, async () => {
     while (cursor < unresolved.length && !signal?.aborted) {
       const id = unresolved[cursor++];
       try {
         const vehicle = await apiGet('bt', `/api/vehicles/${encodeURIComponent(id)}/`, {}, { signal, ttl: 86400000 });
-        vehicles.set(vehicleId(vehicle) || id, vehicle);
+        addVehicleAliases(vehicles, vehicle, id);
       } catch {}
     }
   }));
@@ -1026,14 +1037,18 @@ async function checkWorker() {
   const dot = $('.status-dot');
   try {
     const response = await fetch(`${currentWorkerURL()}/health`, { cache: 'no-store', referrerPolicy: 'no-referrer' });
-    if (!response.ok) throw new Error('Worker unavailable');
+    if (!response.ok) {
+      if (label) label.textContent = response.status === 404 ? 'Worker URL not found' : 'Worker unavailable';
+      if (dot) dot.classList.add('offline');
+      return false;
+    }
     const body = await response.json();
-    label.textContent = body.ok ? 'Data connected' : 'Worker check failed';
-    dot.classList.toggle('offline', !body.ok);
+    if (label) label.textContent = body.ok ? 'Data connected' : 'Worker check failed';
+    if (dot) dot.classList.toggle('offline', !body.ok);
     return !!body.ok;
   } catch {
-    label.textContent = 'Connection needed';
-    dot.classList.add('offline');
+    if (label) label.textContent = 'Connection needed';
+    if (dot) dot.classList.add('offline');
     return false;
   }
 }
@@ -1050,7 +1065,7 @@ async function saveWorker() {
     feedback.classList.add('error-text');
     return;
   }
-  workerBase = url.href.replace(/\/+$/, '');
+  workerBase = url.origin;
   localStorage.setItem(STORAGE.worker, workerBase);
   apiMemory.clear();
   feedback.classList.remove('error-text');

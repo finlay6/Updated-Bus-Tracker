@@ -40,7 +40,10 @@ function normalizeWorkerBase(value) {
     return WORKER_DEFAULT;
   }
 }
-let workerBase = normalizeWorkerBase(localStorage.getItem(STORAGE.worker) || legacy.proxy || WORKER_DEFAULT);
+// Prefer the current Worker configured by this project. An older app may have
+// left a retired proxy URL in `bus-tracker:v1`; keep it available only if the
+// user explicitly saves it in this app's Settings.
+let workerBase = normalizeWorkerBase(localStorage.getItem(STORAGE.worker) || WORKER_DEFAULT);
 let savedFavorites;
 try {
   savedFavorites = JSON.parse(localStorage.getItem(STORAGE.favorites) || 'null');
@@ -60,6 +63,8 @@ const state = {
   selectedRoute: null,
   routeTab: 'live',
   routeLive: [],
+  routeVehicles: new Map(),
+  routeLiveAbort: null,
   routeLiveBusy: false,
   routeLiveError: '',
   routeLiveLoaded: false,
@@ -157,6 +162,11 @@ const mapBusList = $('#map-bus-list');
 const routeResults = $('#route-results');
 const routeDetail = $('#route-detail');
 
+function setHidden(selector, hidden, root = document) {
+  const element = $(selector, root);
+  if (element) element.hidden = Boolean(hidden);
+}
+
 function escapeHTML(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -230,8 +240,13 @@ async function apiGet(kind, path, params = {}, { ttl = 0, signal, text = false, 
           const delay = Number.isFinite(retrySeconds)
             ? retrySeconds * 1000
             : Date.parse(retryHeader) - Date.now();
+          const message = response.status === 404
+            ? body.error === 'Endpoint not allowed.'
+              ? `The Worker rejected ${url.pathname}. Deploy the current worker/index.js, then check the Worker URL in Settings.`
+              : `The Worker returned 404 for ${url.pathname}. Check that the Worker URL points to the deployed API Worker.`
+            : body.error || (response.status === 429 ? 'The data provider is busy.' : `Data service returned ${response.status}.`);
           const error = new DataError(
-            body.error || (response.status === 429 ? 'The data provider is busy.' : `Data service returned ${response.status}.`),
+            message,
             response.status,
             Number.isFinite(delay) && delay > 0 ? delay : 0,
           );
@@ -499,7 +514,10 @@ function switchView(view) {
   document.body.dataset.view = view;
   history.replaceState(null, '', `#${view}`);
   if (view === 'map' && state.mapReady) setTimeout(() => { map?.resize(); refreshMapBuses(); }, 50);
-  if (view === 'setup') $('#worker-url').value = workerBase;
+  if (view === 'setup') {
+    const workerInput = $('#worker-url');
+    if (workerInput) workerInput.value = workerBase;
+  }
 }
 
 function saveFavorites() {
@@ -544,8 +562,38 @@ function renderRouteDetail() {
   if (state.routeTab === 'history') renderHistoryPanel();
 }
 
+function renderRouteLive() {
+  const status = $('#route-live-status', routeDetail || document);
+  const cards = $('#route-live-cards', routeDetail || document);
+  if (!status || !cards) return;
+
+  const rows = state.routeLive.map((bus, index) => ({
+    id: bus.id || bus.journey_id || index,
+    date: londonToday(),
+    datetime: bus.datetime,
+    vehicle: { id: vehicleId(bus.vehicle) },
+  }));
+  const groups = groupRecords(rows, state.routeVehicles);
+  if (state.routeLiveBusy && !state.routeLive.length) {
+    status.textContent = 'Reading current positions…';
+    cards.innerHTML = '<div class="loading-card"><i></i><i></i><i></i></div>';
+    return;
+  }
+  if (state.routeLiveError && !state.routeLive.length) {
+    status.textContent = state.routeLiveError;
+    cards.innerHTML = '';
+    return;
+  }
+  status.textContent = groups.length
+    ? `${fmtNumber.format(state.routeLive.length)} live buses · updated ${clock.format(new Date())}`
+    : state.routeLiveBusy ? 'Reading model and livery details…' : 'No recent live positions for this route.';
+  cards.innerHTML = groups.map((group) => modelCard(group, 'live')).join('')
+    || (state.routeLiveBusy ? '<div class="loading-card"><i></i><i></i><i></i></div>' : '<div class="empty-state">No current model records are available.</div>');
+}
+
 function selectRoute(route) {
   if (!route) return;
+  state.routeLiveAbort?.abort();
   state.historyAbort?.abort();
   state.historyBusy = false;
   state.history = null;
@@ -553,6 +601,7 @@ function selectRoute(route) {
   state.routeTab = 'live';
   state.routeLiveLoaded = false;
   state.routeLive = [];
+  state.routeVehicles = new Map();
   state.routeLiveError = '';
   renderRouteDetail();
   switchView('routes');
@@ -583,30 +632,35 @@ async function searchRoutes(query) {
 async function loadRouteLive(force = false) {
   const route = state.selectedRoute;
   if (!route) return;
+  state.routeLiveAbort?.abort();
+  const controller = new AbortController();
+  state.routeLiveAbort = controller;
   state.routeLiveBusy = true;
   state.routeLiveError = '';
-  const status = $('#route-live-status');
-  const cards = $('#route-live-cards');
-  if (status) status.textContent = 'Reading current positions…';
-  if (cards && !state.routeLive.length) cards.innerHTML = `<div class="loading-card"><i></i><i></i><i></i></div>`;
+  renderRouteLive();
   try {
     const [data, vehicles] = await Promise.all([
-      apiGet('bt', '/vehicles.json', { service: route.id }, { ttl: force ? 5000 : 15000 }),
-      loadFleet(route).catch(() => new Map()),
+      apiGet('bt', '/vehicles.json', { service: route.id }, { ttl: force ? 5000 : 15000, signal: controller.signal }),
+      loadFleet(route, false, controller.signal).catch((error) => {
+        if (controller.signal.aborted) throw error;
+        return new Map();
+      }),
     ]);
-    state.routeLive = (Array.isArray(data) ? data : []).filter((bus) => bus.coordinates?.length === 2 && Date.now() - Date.parse(bus.datetime) < 600000);
+    if (controller.signal.aborted || state.selectedRoute?.id !== route.id) return;
+    state.routeLive = validLiveRows(data);
     state.routeLiveLoaded = true;
     const rows = state.routeLive.map((bus, index) => ({ id: bus.id || bus.journey_id || index, date: londonToday(), datetime: bus.datetime, vehicle: { id: vehicleId(bus.vehicle) } }));
-    await hydrateVehicles(rows, vehicles);
-    const groups = groupRecords(rows, vehicles);
-    if (status) status.textContent = groups.length ? `${fmtNumber.format(state.routeLive.length)} live buses · updated ${clock.format(new Date())}` : 'No recent live positions for this route.';
-    if (cards) cards.innerHTML = groups.map((group) => modelCard(group, 'live')).join('') || `<div class="empty-state">No current model records are available.</div>`;
+    await hydrateVehicles(rows, vehicles, controller.signal);
+    if (controller.signal.aborted || state.selectedRoute?.id !== route.id) return;
+    state.routeVehicles = vehicles;
   } catch (error) {
-    state.routeLiveError = error.message;
-    if (status) status.textContent = error.message;
-    if (cards && !state.routeLive.length) cards.innerHTML = '';
+    if (!controller.signal.aborted && state.selectedRoute?.id === route.id) state.routeLiveError = error.message;
   } finally {
-    state.routeLiveBusy = false;
+    if (state.routeLiveAbort === controller) {
+      state.routeLiveBusy = false;
+      state.routeLiveAbort = null;
+      renderRouteLive();
+    }
   }
 }
 
@@ -787,10 +841,10 @@ function renderMapBuses() {
   mapCount.innerHTML = `<span class="live-pulse"></span><strong>${fmtNumber.format(buses.length)}</strong> ${state.mapRoute ? `on route ${escapeHTML(state.mapRoute.line_name)}` : 'buses in view'}`;
   $('#map-time').textContent = state.mapUpdated ? `Updated ${clock.format(state.mapUpdated)}` : 'Waiting for buses';
   $('#dock-title').textContent = state.mapRoute ? `Route ${state.mapRoute.line_name}` : 'Nearby buses';
-  $('#map-clear-route').hidden = !state.mapRoute;
+  setHidden('#map-clear-route', !state.mapRoute);
   const status = state.mapError ? state.mapError : state.mapBusy && !buses.length ? 'Loading live positions…' : !buses.length ? 'No recent buses in this map area.' : '';
   mapMessage.textContent = status;
-  mapMessage.hidden = !status;
+  if (mapMessage) mapMessage.hidden = !status;
   mapBusList.innerHTML = buses.slice(0, 18).map((bus) => {
     const key = busKey(bus);
     return `<button class="map-bus-row" data-action="focus-bus" data-id="${escapeHTML(key)}"><span class="route-badge small-badge">${escapeHTML(bus.service?.line_name || '?')}</span><span class="bus-row-copy"><strong>${escapeHTML(bus.destination || bus.service?.description || 'In service')}</strong><small>${escapeHTML(bus.service?.line_name ? `Route ${bus.service.line_name}` : 'Live bus')} · ${clock.format(new Date(bus.datetime))}</small></span><span class="row-arrow">↗</span></button>`;
@@ -848,13 +902,17 @@ function initMap() {
     });
     map.on('error', (event) => {
       if (event?.error && !state.mapReady) {
-        mapMessage.textContent = 'Satellite tiles could not be reached. Check your connection.';
-        mapMessage.hidden = false;
+        if (mapMessage) {
+          mapMessage.textContent = 'Satellite tiles could not be reached. Check your connection.';
+          mapMessage.hidden = false;
+        }
       }
     });
   } catch (error) {
-    mapMessage.textContent = 'The map could not be started. Refresh the page to try again.';
-    mapMessage.hidden = false;
+    if (mapMessage) {
+      mapMessage.textContent = 'The map could not be started. Refresh the page to try again.';
+      mapMessage.hidden = false;
+    }
   }
 }
 
@@ -944,18 +1002,22 @@ function syncMarkers(buses) {
 
 function locateMap() {
   if (!navigator.geolocation) {
-    mapMessage.textContent = 'Location is not available in this browser.';
-    mapMessage.hidden = false;
+    if (mapMessage) {
+      mapMessage.textContent = 'Location is not available in this browser.';
+      mapMessage.hidden = false;
+    }
     return;
   }
-  mapMessage.textContent = 'Finding your location…';
-  mapMessage.hidden = false;
+  if (mapMessage) {
+    mapMessage.textContent = 'Finding your location…';
+    mapMessage.hidden = false;
+  }
   navigator.geolocation.getCurrentPosition((position) => {
     state.mapRoute = null;
     map.flyTo({ center: [position.coords.longitude, position.coords.latitude], zoom: Math.max(map.getZoom(), 13), duration: 650 });
-    mapMessage.hidden = true;
+    if (mapMessage) mapMessage.hidden = true;
   }, () => {
-    mapMessage.textContent = 'Location permission was unavailable. Move the map to your area instead.';
+    if (mapMessage) mapMessage.textContent = 'Location permission was unavailable. Move the map to your area instead.';
   }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 });
 }
 
@@ -1027,7 +1089,16 @@ document.addEventListener('click', async (event) => {
   const action = button.dataset.action;
   if (action === 'navigate') switchView(button.dataset.view);
   if (action === 'select-route') selectRoute(findRoute(button.dataset.id));
-  if (action === 'clear-route') { state.selectedRoute = null; state.historyAbort?.abort(); state.historyBusy = false; state.history = null; renderRouteDetail(); }
+  if (action === 'clear-route') {
+    state.routeLiveAbort?.abort();
+    state.routeLiveAbort = null;
+    state.routeLiveBusy = false;
+    state.selectedRoute = null;
+    state.historyAbort?.abort();
+    state.historyBusy = false;
+    state.history = null;
+    renderRouteDetail();
+  }
   if (action === 'route-tab') {
     state.routeTab = button.dataset.tab;
     $$('.route-tab', routeDetail).forEach((tab) => {
@@ -1035,8 +1106,8 @@ document.addEventListener('click', async (event) => {
       tab.classList.toggle('active', active);
       tab.setAttribute('aria-selected', String(active));
     });
-    $('#route-live-panel').hidden = state.routeTab !== 'live';
-    $('#route-history-panel').hidden = state.routeTab !== 'history';
+    setHidden('#route-live-panel', state.routeTab !== 'live', routeDetail);
+    setHidden('#route-history-panel', state.routeTab !== 'history', routeDetail);
     if (state.routeTab === 'live' && !state.routeLiveLoaded) loadRouteLive();
     if (state.routeTab === 'history' && !state.history) loadHistory();
   }

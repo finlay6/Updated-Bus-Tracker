@@ -758,13 +758,16 @@ async function loadHistory(force = false) {
     }
     return { date, rows: [], complete: false, error: '', stale: true };
   }));
+  if (controller.signal.aborted || state.historyAbort !== controller || state.selectedRoute?.id !== route.id) return;
   state.history = { routeId: route.id, totalDays: dates.length, days: entries, vehicles, rateLimitMessage: '' };
   renderHistoryPanel();
 
   const fleetPromise = loadFleet(route, false, controller.signal).then((fleet) => {
-    state.history.vehicles = new Map([...state.history.vehicles, ...fleet]);
+    if (!controller.signal.aborted && state.historyAbort === controller && state.history) {
+      state.history.vehicles = new Map([...state.history.vehicles, ...fleet]);
+    }
   }).catch((error) => {
-    state.history.fleetError = error.message;
+    if (!controller.signal.aborted && state.historyAbort === controller && state.history) state.history.fleetError = error.message;
   });
   const queue = dates.map((date, index) => ({ date, index })).filter(({ date, index }) => {
     const entry = entries[index];
@@ -776,7 +779,7 @@ async function loadHistory(force = false) {
   const totalRows = () => state.history.days.reduce((sum, day) => sum + (day.rows?.length || 0), 0);
   renderHistoryPanel();
   const worker = async () => {
-    while (cursor < queue.length && !controller.signal.aborted && !state.history?.rateLimitMessage) {
+    while (cursor < queue.length && !controller.signal.aborted && state.historyAbort === controller && state.selectedRoute?.id === route.id && !state.history?.rateLimitMessage) {
       const { date, index } = queue[cursor++];
       const cached = entries[index];
       try {
@@ -789,17 +792,18 @@ async function loadHistory(force = false) {
       } catch (error) {
         if (controller.signal.aborted) break;
         entries[index] = { ...cached, date, error: error.message || 'History unavailable.', complete: false };
-        if (error.status === 429 && state.history) {
+        if (error.status === 429 && state.historyAbort === controller && state.history) {
           state.history.rateLimitMessage = 'Bustimes has rate-limited this archive scan. It has paused to protect the remaining requests; wait briefly, then refresh history to continue.';
         }
       }
+      if (controller.signal.aborted || state.historyAbort !== controller || state.selectedRoute?.id !== route.id) break;
       state.history.days = entries;
       renderHistoryPanel();
     }
   };
   try {
     await Promise.all(Array.from({ length: Math.min(1, queue.length) }, worker));
-    if (!controller.signal.aborted) {
+    if (!controller.signal.aborted && state.historyAbort === controller && state.selectedRoute?.id === route.id) {
       await fleetPromise;
       const rows = entries.flatMap((entry) => entry.rows || []);
       await hydrateVehicles(rows, state.history.vehicles, controller.signal);

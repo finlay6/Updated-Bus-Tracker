@@ -10,6 +10,7 @@ const STORAGE = {
   favorites: 'bus-tracker:favorites',
   period: 'bus-tracker:period',
 };
+const HISTORY_CACHE_PREFIX = 'history:v2';
 const apiMemory = new Map();
 const pendingRequests = new Map();
 const fmtNumber = new Intl.NumberFormat('en-GB');
@@ -698,13 +699,19 @@ function renderHistoryPanel() {
   if (stats) stats.innerHTML = history ? `<span><strong>${fmtNumber.format(rows.length)}</strong> journeys</span><span><strong>${fmtNumber.format(groups.length)}</strong> model &amp; livery records</span><span><strong>${fmtNumber.format(loadedDays)}</strong> days read</span>` : '';
   const errors = days.filter((day) => day.error);
   const errorElement = $('#history-error');
-  if (errorElement) errorElement.textContent = errors.length ? `${errors.length} day${errors.length === 1 ? '' : 's'} could not be read. Retry to fill in missing records. ${errors[0].error}` : '';
+  if (errorElement) {
+    errorElement.textContent = history?.rateLimitMessage
+      ? `${history.rateLimitMessage}${errors[0]?.error ? ` ${errors[0].error}` : ''}`
+      : errors.length ? `${errors.length} day${errors.length === 1 ? '' : 's'} could not be read. Retry to fill in missing records. ${errors[0].error}` : '';
+  }
   const cards = $('#history-cards');
   if (cards) cards.innerHTML = groups.map((group) => modelCard(group)).join('');
   const empty = $('#history-empty');
   if (empty) {
     empty.hidden = !!rows.length || state.historyBusy;
-    empty.textContent = errors.length ? 'No saved journeys yet. Retry after the provider is available.' : 'No vehicle journeys were returned for this route and period.';
+    empty.textContent = history?.rateLimitMessage
+      ? 'The archive scan paused before it could finish. Completed dates are kept above; retry later to continue.'
+      : errors.length ? 'No saved journeys yet. Retry after the provider is available.' : 'No vehicle journeys were returned for this route and period.';
   }
 }
 
@@ -717,7 +724,7 @@ async function fetchHistoryDay(route, date, signal) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     if (visited.has(path)) throw new DataError(`The provider repeated a history page for ${date}.`);
     visited.add(path);
-    const data = await apiGet('bt', path, params, { signal, retry: true });
+    const data = await apiGet('bt', path, params, { signal, retry: false });
     params = {};
     if (!Array.isArray(data.results)) throw new DataError('The history response had an unexpected format.');
     for (const row of data.results) {
@@ -743,7 +750,7 @@ async function loadHistory(force = false) {
   const dates = datesBack(historyPeriod);
   let vehicles = new Map();
   const entries = await Promise.all(dates.map(async (date) => {
-    const key = `history:${route.id}:${date}`;
+    const key = `${HISTORY_CACHE_PREFIX}:${route.id}:${date}`;
     const cached = await savedGet(key);
     if (cached) {
       vehicles = new Map([...vehicles, ...(cached.vehicles || [])]);
@@ -751,7 +758,7 @@ async function loadHistory(force = false) {
     }
     return { date, rows: [], complete: false, error: '', stale: true };
   }));
-  state.history = { routeId: route.id, totalDays: dates.length, days: entries, vehicles };
+  state.history = { routeId: route.id, totalDays: dates.length, days: entries, vehicles, rateLimitMessage: '' };
   renderHistoryPanel();
 
   const fleetPromise = loadFleet(route, false, controller.signal).then((fleet) => {
@@ -769,7 +776,7 @@ async function loadHistory(force = false) {
   const totalRows = () => state.history.days.reduce((sum, day) => sum + (day.rows?.length || 0), 0);
   renderHistoryPanel();
   const worker = async () => {
-    while (cursor < queue.length && !controller.signal.aborted) {
+    while (cursor < queue.length && !controller.signal.aborted && !state.history?.rateLimitMessage) {
       const { date, index } = queue[cursor++];
       const cached = entries[index];
       try {
@@ -777,18 +784,21 @@ async function loadHistory(force = false) {
         day.fetchedAt = Date.now();
         entries[index] = day;
         const ttl = date === londonToday() ? 60000 : 14 * 86400000;
-        await savedPut(`history:${route.id}:${date}`, { day, vehicles: [] }, ttl);
+        await savedPut(`${HISTORY_CACHE_PREFIX}:${route.id}:${date}`, { day, vehicles: [] }, ttl);
         completed++;
       } catch (error) {
         if (controller.signal.aborted) break;
         entries[index] = { ...cached, date, error: error.message || 'History unavailable.', complete: false };
+        if (error.status === 429 && state.history) {
+          state.history.rateLimitMessage = 'Bustimes has rate-limited this archive scan. It has paused to protect the remaining requests; wait briefly, then refresh history to continue.';
+        }
       }
       state.history.days = entries;
       renderHistoryPanel();
     }
   };
   try {
-    await Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(1, queue.length) }, worker));
     if (!controller.signal.aborted) {
       await fleetPromise;
       const rows = entries.flatMap((entry) => entry.rows || []);
@@ -796,7 +806,7 @@ async function loadHistory(force = false) {
       state.history.days = entries;
       state.history.vehicles = new Map(state.history.vehicles);
       for (const day of entries) if (day.complete && !day.error) {
-        await savedPut(`history:${route.id}:${day.date}`, { day, vehicles: [] }, day.date === londonToday() ? 60000 : 14 * 86400000);
+        await savedPut(`${HISTORY_CACHE_PREFIX}:${route.id}:${day.date}`, { day, vehicles: [] }, day.date === londonToday() ? 60000 : 14 * 86400000);
       }
     }
   } finally {

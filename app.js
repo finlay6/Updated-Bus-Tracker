@@ -715,10 +715,10 @@ function renderHistoryPanel() {
   }
 }
 
-async function fetchHistoryDay(route, date, signal) {
+async function fetchHistoryDay(route, date, signal, onProgress, initialRows = []) {
   let path = '/api/vehiclejourneys/';
   let params = { service: route.id, date, limit: 1000 };
-  const rows = new Map();
+  const rows = new Map(initialRows.map((row) => [String(row.id), row]));
   const visited = new Set();
   for (let page = 0; page < 1000; page++) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -733,6 +733,7 @@ async function fetchHistoryDay(route, date, signal) {
       if (Number.isFinite(Date.parse(row.datetime)) && Date.parse(row.datetime) > Date.now() + 60000) continue;
       rows.set(String(row.id), row);
     }
+    onProgress?.({ date, rows: [...rows.values()], complete: false, error: '' });
     const next = isValidNext(data.next, '/api/vehiclejourneys/', { service: route.id, date });
     if (!next) return { date, rows: [...rows.values()], complete: true, error: '' };
     path = next;
@@ -783,7 +784,23 @@ async function loadHistory(force = false) {
       const { date, index } = queue[cursor++];
       const cached = entries[index];
       try {
-        const day = await fetchHistoryDay(route, date, controller.signal);
+        let day;
+        const reportProgress = (partial) => {
+          entries[index] = { ...partial, fetchedAt: Date.now() };
+          state.history.days = entries;
+          renderHistoryPanel();
+        };
+        try {
+          day = await fetchHistoryDay(route, date, controller.signal, reportProgress, cached.rows || []);
+        } catch (error) {
+          if (error.status !== 429 || !error.retryAfter) throw error;
+          state.history.rateLimitMessage = `Bustimes asked the archive scan to pause for ${Math.ceil(error.retryAfter / 1000)} seconds. It will retry this date automatically.`;
+          renderHistoryPanel();
+          await wait(error.retryAfter + 1000, controller.signal);
+          if (state.historyAbort !== controller || controller.signal.aborted) break;
+          state.history.rateLimitMessage = '';
+          day = await fetchHistoryDay(route, date, controller.signal, reportProgress, entries[index].rows || cached.rows || []);
+        }
         day.fetchedAt = Date.now();
         entries[index] = day;
         const ttl = date === londonToday() ? 60000 : 14 * 86400000;
@@ -791,7 +808,9 @@ async function loadHistory(force = false) {
         completed++;
       } catch (error) {
         if (controller.signal.aborted) break;
-        entries[index] = { ...cached, date, error: error.message || 'History unavailable.', complete: false };
+        const partial = entries[index] || cached;
+        entries[index] = { ...partial, date, rows: partial.rows || cached.rows || [], error: error.message || 'History unavailable.', complete: false };
+        await savedPut(`${HISTORY_CACHE_PREFIX}:${route.id}:${date}`, { day: entries[index], vehicles: [] }, 60 * 60 * 1000);
         if (error.status === 429 && state.historyAbort === controller && state.history) {
           state.history.rateLimitMessage = 'Bustimes has rate-limited this archive scan. It has paused to protect the remaining requests; wait briefly, then refresh history to continue.';
         }
